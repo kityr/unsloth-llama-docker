@@ -21,6 +21,7 @@ jobs:
       packages: read
     outputs:
       ref: ${{ steps.check.outputs.ref }}
+      base: ${{ steps.check.outputs.base }}
       repo_lc: ${{ steps.check.outputs.repo_lc }}
       cuda_version: ${{ steps.check.outputs.cuda_version }}
       should_build: ${{ steps.check.outputs.should_build }}
@@ -34,6 +35,8 @@ jobs:
 
       - name: Check for new Unsloth release
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           REPO_LC="${GITHUB_REPOSITORY,,}"
           CUDA_VER="${{ github.event.inputs.cuda_version || '13.5.0' }}"
@@ -43,11 +46,14 @@ jobs:
           if [ -n "${{ github.event.inputs.ref }}" ]; then
             TAG="${{ github.event.inputs.ref }}"
           else
-            TAG=$(curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases?per_page=1" | jq -r '.[0].tag_name')
+            TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/unslothai/llama.cpp/releases?per_page=1" | jq -r '.[0].tag_name')
           fi
+          BASE="${TAG%%-mix-*}"
           echo "ref=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.event.name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -60,9 +66,81 @@ jobs:
           done
           echo "should_build=false" >> "$GITHUB_OUTPUT"
 
-  build:
+  prepare-source:
     needs: check-release
     if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone upstream base and Unsloth pin scripts
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git src
+          git -C src checkout "${{ needs.check-release.outputs.base }}"
+          git clone --depth 1 --branch "${{ needs.check-release.outputs.ref }}" \
+            https://github.com/unslothai/llama.cpp.git unsloth
+
+      - name: Apply Unsloth pr-set.json pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, urllib.request
+          from pathlib import Path
+
+          src = Path("src").resolve()
+          additive = Path("unsloth/scripts/unsloth/additive_merge.py").resolve()
+          pr_set = json.loads(Path("unsloth/scripts/unsloth/pr-set.json").read_text())
+
+          def run(cmd, check=True):
+              return subprocess.run(cmd, cwd=src, check=check)
+
+          run(["git", "config", "user.name", "unsloth-builder"])
+          run(["git", "config", "user.email", "builder@localhost"])
+          run(["git", "config", "merge.conflictStyle", "diff3"])
+
+          pat = re.compile(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)/commits/([0-9a-f]+)")
+          token = os.environ.get("GH_TOKEN", "")
+
+          for entry in pr_set.get("prs", []):
+              url = entry["url"] if isinstance(entry, dict) else entry
+              required = entry.get("required", True) if isinstance(entry, dict) else True
+              m = pat.match(url)
+              if not m:
+                  raise ValueError(f"Unrecognized pin URL: {url}")
+              repo, pr_num, sha = m.groups()
+
+              if not required:
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/pulls/{pr_num}",
+                      headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                  )
+                  with urllib.request.urlopen(req) as resp:
+                      if json.loads(resp.read())["state"] != "open":
+                          print(f"Skipping closed optional pin {repo}#{pr_num}")
+                          continue
+
+              print(f"Merging {repo}#{pr_num} @ {sha[:9]} ...")
+              run(["git", "fetch", "--no-tags", f"https://github.com/{repo}.git", sha])
+              res = run(["git", "merge", "--no-edit", "--no-ff", sha], check=False)
+              if res.returncode != 0:
+                  print(f"Conflict on {repo}#{pr_num}, running additive_merge.py ...")
+                  run(["python3", str(additive)], check=True)
+                  run(["git", "add", "-A"])
+                  run(["git", "commit", "--no-edit"])
+          PY
+
+      - name: Pack merged source tree
+        run: tar -cf merged-src.tar -C src .
+
+      - name: Upload merged source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-src
+          path: merged-src.tar
+          retention-days: 1
+          compression-level: 0
+
+  build:
+    needs: [check-release, prepare-source]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -103,16 +181,16 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           sudo docker image prune --all --force
 
-      - name: Fetch Unsloth merged source tree
+      - name: Download merged source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: merged-src
+
+      - name: Unpack merged source
         run: |
-          TAG="${{ needs.check-release.outputs.ref }}"
-          SRC_URL=$(curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/${TAG}" \
-            | jq -r '.assets[] | select(.name | test("^source.*\\.tar\\.gz$")) | .browser_download_url' \
-            | head -n1)
-          test -n "$SRC_URL"
-          curl -fsSL "$SRC_URL" -o source.tar.gz
-          tar -xzf source.tar.gz --strip-components=1
-          rm -f source.tar.gz
+          mkdir src
+          tar -xf merged-src.tar -C src
+          rm -f merged-src.tar
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -127,8 +205,8 @@ jobs:
       - name: Build and push ${{ matrix.tag }}
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
+          context: ./src
+          file: ./src/${{ matrix.dockerfile }}
           target: server
           push: true
           build-args: ${{ matrix.build_args }}
