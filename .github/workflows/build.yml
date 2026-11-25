@@ -6,17 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag, or commit in unslothai/llama.cpp (empty = latest release)"
+        description: "Release tag in unslothai/llama.cpp (empty = latest)"
         required: false
         default: ""
-      cuda_version:
-        description: "CUDA toolkit version (e.g. 13.5.0, 13.1.1, 13.0.2)"
-        required: false
-        default: "13.5.0"
-      cuda_arch:
-        description: "CUDA_DOCKER_ARCH ('default' for all GPUs, or e.g. '89' for Ada)"
-        required: false
-        default: "default"
 
 jobs:
   check-release:
@@ -44,7 +36,7 @@ jobs:
           if [ -n "${{ github.event.inputs.ref }}" ]; then
             TAG="${{ github.event.inputs.ref }}"
           else
-            TAG=$(curl -fsSL https://api.github.com/repos/unslothai/llama.cpp/releases/latest | jq -r .tag_name)
+            TAG=$(curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases?per_page=1" | jq -r '.[0].tag_name')
           fi
           echo "ref=${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -68,25 +60,36 @@ jobs:
       matrix:
         include:
           - tag: server
-            dockerfile: .devops/cpu.Dockerfile
-            cuda_version: ""
+            asset_regex: "linux-x64-cpu.*\\.tar\\.gz$"
           - tag: server-cuda13
-            dockerfile: .devops/cuda.Dockerfile
-            cuda_version: ${{ github.event.inputs.cuda_version || '13.5.0' }}
+            asset_regex: "linux-x64-cuda13-portable\\.tar\\.gz$"
 
     steps:
-      - name: Free disk space (required for CUDA 13 devel image)
-        if: matrix.tag == 'server-cuda13'
+      - name: Download and extract Unsloth prebuilt
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune --all --force
+          TAG="${{ needs.check-release.outputs.ref }}"
+          URL=$(curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/${TAG}" \
+            | jq -r --arg re "${{ matrix.asset_regex }}" '.assets[] | select(.name | test($re)) | .browser_download_url' \
+            | head -n1)
+          test -n "$URL"
+          curl -fsSL "$URL" -o bundle.tar.gz
+          mkdir -p unpack app
+          tar -xzf bundle.tar.gz -C unpack
+          BIN_DIR=$(dirname "$(find unpack -name llama-server -type f | head -n1)")
+          cp -a "${BIN_DIR}/." app/
+          chmod +x app/llama-server
 
-      - name: Checkout unslothai/llama.cpp
-        uses: actions/checkout@v4
-        with:
-          repository: unslothai/llama.cpp
-          ref: ${{ needs.check-release.outputs.ref }}
-          fetch-depth: 1
+      - name: Write Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          FROM ubuntu:24.04
+          RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates && rm -rf /var/lib/apt/lists/*
+          WORKDIR /app
+          COPY app/ /app/
+          ENV LD_LIBRARY_PATH=/app LLAMA_ARG_HOST=0.0.0.0 LLAMA_ARG_PORT=8080
+          EXPOSE 8080
+          ENTRYPOINT ["/app/llama-server"]
+          EOF
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -102,14 +105,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
-          target: server
+          file: Dockerfile
           push: true
-          build-args: |
-            CUDA_VERSION=${{ matrix.cuda_version }}
-            CUDA_DOCKER_ARCH=${{ github.event.inputs.cuda_arch || 'default' }}
           tags: |
             ghcr.io/${{ needs.check-release.outputs.repo_lc }}:${{ matrix.tag }}
             ghcr.io/${{ needs.check-release.outputs.repo_lc }}:${{ matrix.tag }}-${{ needs.check-release.outputs.ref }}
-          cache-from: type=gha,scope=${{ matrix.tag }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.tag }}
