@@ -13,10 +13,6 @@ on:
         description: "CUDA toolkit version (e.g. 13.5.0, 13.1.1, 13.0.2)"
         required: false
         default: "13.5.0"
-      cuda_arch:
-        description: "CUDA_DOCKER_ARCH ('89' for Ada, 'default' for all GPUs)"
-        required: false
-        default: "89"
 
 jobs:
   check-release:
@@ -26,6 +22,7 @@ jobs:
     outputs:
       ref: ${{ steps.check.outputs.ref }}
       repo_lc: ${{ steps.check.outputs.repo_lc }}
+      cuda_version: ${{ steps.check.outputs.cuda_version }}
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - name: Log in to GHCR
@@ -39,7 +36,9 @@ jobs:
         id: check
         run: |
           REPO_LC="${GITHUB_REPOSITORY,,}"
+          CUDA_VER="${{ github.event.inputs.cuda_version || '13.5.0' }}"
           echo "repo_lc=${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "cuda_version=${CUDA_VER}" >> "$GITHUB_OUTPUT"
 
           if [ -n "${{ github.event.inputs.ref }}" ]; then
             TAG="${{ github.event.inputs.ref }}"
@@ -48,13 +47,18 @@ jobs:
           fi
           echo "ref=${TAG}" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event.name }}" = "workflow_dispatch" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-          elif docker manifest inspect "ghcr.io/${REPO_LC}:server-cuda13-${TAG}" > /dev/null 2>&1; then
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          for VARIANT in server server-cuda13 server-cuda13-sm89 server-rocm server-vulkan; do
+            if ! docker manifest inspect "ghcr.io/${REPO_LC}:${VARIANT}-${TAG}" > /dev/null 2>&1; then
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "should_build=false" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check-release
@@ -69,14 +73,32 @@ jobs:
         include:
           - tag: server
             dockerfile: .devops/cpu.Dockerfile
-            cuda_version: ""
+            free_disk: false
+            build_args: ""
           - tag: server-cuda13
             dockerfile: .devops/cuda.Dockerfile
-            cuda_version: ${{ github.event.inputs.cuda_version || '13.5.0' }}
+            free_disk: true
+            build_args: |
+              CUDA_VERSION=${{ needs.check-release.outputs.cuda_version }}
+              CUDA_DOCKER_ARCH=default
+          - tag: server-cuda13-sm89
+            dockerfile: .devops/cuda.Dockerfile
+            free_disk: true
+            build_args: |
+              CUDA_VERSION=${{ needs.check-release.outputs.cuda_version }}
+              CUDA_DOCKER_ARCH=89
+          - tag: server-rocm
+            dockerfile: .devops/rocm.Dockerfile
+            free_disk: true
+            build_args: ""
+          - tag: server-vulkan
+            dockerfile: .devops/vulkan.Dockerfile
+            free_disk: false
+            build_args: ""
 
     steps:
-      - name: Free disk space (required for CUDA 13 devel image)
-        if: matrix.tag == 'server-cuda13'
+      - name: Free disk space (required for CUDA 13 / ROCm dev images)
+        if: matrix.free_disk
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           sudo docker image prune --all --force
@@ -109,9 +131,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           target: server
           push: true
-          build-args: |
-            CUDA_VERSION=${{ matrix.cuda_version }}
-            CUDA_DOCKER_ARCH=${{ github.event.inputs.cuda_arch || '89' }}
+          build-args: ${{ matrix.build_args }}
           tags: |
             ghcr.io/${{ needs.check-release.outputs.repo_lc }}:${{ matrix.tag }}
             ghcr.io/${{ needs.check-release.outputs.repo_lc }}:${{ matrix.tag }}-${{ needs.check-release.outputs.ref }}
