@@ -48,11 +48,14 @@ After=network-online.target
 Image=ghcr.io/kityr/unsloth-llama-docker:server-cuda13
 ContainerName=llama-server
 
+# Expose port 8080 (use 127.0.0.1:8080:8080 to bind localhost only)
+PublishPort=8080:8080
+
 # Mount your GGUF directory into /models (use :z or :Z on SELinux systems)
 Volume=/path/to/models:/models:z
 
 # NVIDIA GPU access via CDI (requires nvidia-ctk cdi generate)
-AddDevice=[nvidia.com/gpu=all](https://nvidia.com/gpu=all)
+AddDevice=nvidia.com/gpu=all
 # For AMD GPUs (ROCm / Vulkan), use instead:
 # AddDevice=/dev/kfd
 # AddDevice=/dev/dri
@@ -60,12 +63,11 @@ AddDevice=[nvidia.com/gpu=all](https://nvidia.com/gpu=all)
 # Uncomment to let podman-auto-update pull new builds automatically
 # AutoUpdate=registry
 
-# Single-model mode:
+# Single-model mode (--host 0.0.0.0 is required inside the container for PublishPort):
 Exec=-m /models/your-model.gguf -ngl 99 -c 32768 --host 0.0.0.0 --port 8080
 # Or router mode with a presets file:
 # Exec=--models-preset /models/models.ini --host 0.0.0.0 --port 8080
 
-Network=host
 SecurityLabelDisable=true
 
 [Service]
