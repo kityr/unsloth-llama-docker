@@ -78,7 +78,7 @@ RestartSec=5s
 WantedBy=multi-user.target
 ```
 
-Enable and start the service (if rootless, add --user after systemctl, and omit sudo):
+Enable and start the service (if rootless, add `--user` after `systemctl`, and omit `sudo`):
 
 ```bash
 sudo systemctl daemon-reload
