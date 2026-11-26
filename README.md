@@ -83,4 +83,5 @@ Enable and start the service:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now llama-server
+journalctl -fu llama-server # watch the service logs as it pulls the image and starts up
 ```
